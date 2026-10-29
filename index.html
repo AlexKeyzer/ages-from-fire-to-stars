@@ -1528,6 +1528,7 @@ var I18N = {
     adTimerGot: 'Награда получена!',
     adTimerEarly: 'Ролик закрыт на {a} с из {b} — без награды',
     adTimerNoVerify: 'Не удалось подтвердить просмотр — без награды',
+    adTimerWait: 'Подтверждаем просмотр…',
     adSimTitle: 'Реклама · тестовый режим',
     adSimSub: 'Вне VK рекламу заменяет отсчёт 30 секунд: досмотрел до конца — награда, закрыл раньше — без награды.',
     adSimClose: 'Закрыть рекламу',
@@ -1616,6 +1617,7 @@ var I18N = {
     adTimerGot: 'Reward received!',
     adTimerEarly: 'Closed at {a}s of {b}s — no reward',
     adTimerNoVerify: 'Could not verify the ad watch — no reward',
+    adTimerWait: 'Verifying the watch…',
     adSimTitle: 'Ad · test mode',
     adSimSub: 'Outside VK the ad is replaced by a 30-second countdown: finish it for the reward, close early for nothing.',
     adSimClose: 'Close ad',
@@ -1926,7 +1928,10 @@ var VK = (function () {
      раннее закрытие ('early'), нет итогового события за AD_VERIFY_MS ('noverify'),
      нет филла ('nofill'), сбой показа/отправки ('error').
      v3.5: вне VK — тестовый режим: собственный отсчёт AD_MIN_WATCH_MS со стеной-заглушкой,
-     награда только досидевшему до конца (simulated=true), раннее закрытие — 'early'. */
+     награда только досидевшему до конца (simulated=true), раннее закрытие — 'early'.
+     v3.5.1: счётчик стартует с момента подтверждения просмотра (до open-ack) — виден весь ролик
+     даже в клиентах, где send() резолвится при закрытии (VK Web); «тихий» клиент с поздним
+     резолвом (≥ minWatch от подтверждения) грантится по резолву; openGuard = AD_VERIFY_MS. */
   api.reward = function (onDone) {
     var done = false;
     var clearH = function () { rewardEvent = null; rewardFailed = null; };
@@ -1955,6 +1960,11 @@ var VK = (function () {
     var minWatch = (typeof GAME !== 'undefined' && GAME.AD_MIN_WATCH_MS) || 30000;
     var verifyMs = (typeof GAME !== 'undefined' && GAME.AD_VERIFY_MS) || 60000;
     var reqAt = Date.now(), shownAt = 0;
+    /* v3.5.1: счётчик стартует с момента подтверждения, а не с open-ack: в части клиентов
+       (VK Web, десктоп) send() резолвится только при закрытии ролика, а у плеера платформы
+       нет секунд — пилюля «Награда через: N с» обязана быть видна весь просмотр
+       (плеер платформы не перекрывает верх страницы, см. скрин владельца). */
+    try { if (typeof api.onAdShown === 'function') api.onAdShown(minWatch); } catch (e) { /* hook */ }
     rewardEvent = function (d) {
       if (done) return;
       var now = Date.now();
@@ -1966,13 +1976,14 @@ var VK = (function () {
       else finish(false, false, 'early');
     };
     rewardFailed = function () { if (!done) finish(false, false, 'error'); };
-    var openGuard = setTimeout(function () { if (!done) finish(false, false, 'error'); }, 25000);
+    var openGuard = setTimeout(function () { if (!done) finish(false, false, 'error'); }, verifyMs);
     send('VKWebAppShowNativeAds', { ad_format: 'reward', use_waterfall: true }).then(function (d) {
       clearTimeout(openGuard);
       if (d && d.result === false) { log('reward: no fill → no grant'); finish(false, false, 'nofill'); return; }
+      /* v3.5.1: «тихий» клиент, у которого send резолвится при закрытии: резолв позже minWatch
+         от подтверждения — факт полного просмотра (в обычных клиентах резолв на открытии, <1 с). */
+      if (!done && (Date.now() - reqAt) >= minWatch) { log('reward: late resolve ≥ minWatch → watched'); finish(true, false, 'watched'); return; }
       shownAt = Date.now();
-      /* v3.4.2: сессия стартовала — UI показывает счётчик секунд до награды */
-      try { if (typeof api.onAdShown === 'function') api.onAdShown(minWatch); } catch (e) { /* hook */ }
       setTimeout(function () { if (!done && shownAt) { log('reward: no session event → not verified'); finish(false, false, 'noverify'); } }, verifyMs);
     }).catch(function () {
       clearTimeout(openGuard);
@@ -3946,9 +3957,10 @@ UI.adTimer = {
     if (!self.el || !self.el.parentNode) return;
     var left = Math.max(0, self.minSec - Math.floor((Date.now() - self.t0) / 1000));
     var txt = self.el.querySelector('.at-txt');
-    if (txt) txt.textContent = T('adTimerLeft', { n: left });
+    /* v3.5.1: отсчёт дошёл до 0 раньше итогового события (платформа подтверждает с задержкой) */
+    if (txt) txt.textContent = left > 0 ? T('adTimerLeft', { n: left }) : T('adTimerWait');
     var bar = self.el.querySelector('.at-bar i');
-    if (bar) bar.style.width = Math.max(0, Math.min(100, (left / self.minSec) * 100)) + '%';
+    if (bar) bar.style.width = (left > 0 ? Math.max(0, Math.min(100, (left / self.minSec) * 100)) : 0) + '%';
   },
   start: function (minMs) {
     var self = UI.adTimer;
