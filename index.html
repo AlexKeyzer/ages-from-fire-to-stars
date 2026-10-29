@@ -656,9 +656,7 @@ body.lowfx .intro-slide { filter: none; }
 .nav-btn .nav-badge.pulseb { animation: pulse 1.1s ease-in-out infinite; }
 
 /* ============================== v3.3 COMPLIANCE ========================== */
-#consentGate, #authStub { position: absolute; inset: 0; z-index: 96; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(6,4,14,.72); }
-.consent-body { max-height: 46vh; overflow-y: auto; -webkit-overflow-scrolling: touch; padding-right: 4px; }
-.consent-modal { max-width: 400px; }
+#authStub { position: absolute; inset: 0; z-index: 96; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(6,4,14,.72); }
 
 </style>
 </head>
@@ -1522,11 +1520,6 @@ var I18N = {
     giftSend: 'Отправить подарок другу', giftSent: 'Подарок отправлен! Тебе тоже начислен сундук.',
     giftReceived: '🎁 Друг прислал тебе сундук!', giftOnce: 'Подарок доступен раз в день',
     eraProg: 'Прогресс эпохи',
-    consentTitle: 'Соглашение и конфиденциальность',
-    consentBody: 'Возрастное ограничение: 0+.\nМы обрабатываем минимум данных: идентификатор и имя профиля VK (для сохранений и лидерборда друзей) и игровой прогресс в облачном хранилище VK. Реклама — только механизмы платформы VK, награды — по вашему нажатию. Полные тексты: пользовательское соглашение и политика конфиденциальности в карточке игры и в настройках.',
-    consentAccept: 'Принять и играть', consentDecline: 'Не принимать',
-    consentBlocked: 'Без принятия соглашения и политики конфиденциальности доступ к игре невозможен (п. 1.1.4 правил платформы).',
-    consentReopen: 'Открыть условия снова', consentInSettings: 'Соглашение и политика',
     authTitle: 'Запуск из ВКонтакте', authText: 'Не удалось подтвердить параметры запуска VK (подпись vk_sign отсутствует). Откройте игру из каталога игр ВКонтакте или обновите страницу.',
     authRetry: 'Повторить', giftSent: 'Подарок отправлен другу! Он получит сундук при запуске.',
     inviteReward: 'Когда друг запустит игру по вашему приглашению, вы получите заряд легендарного чуда'
@@ -1606,11 +1599,6 @@ var I18N = {
     giftSend: 'Send a gift to a friend', giftSent: 'Gift sent! You got a chest too.',
     giftReceived: '🎁 A friend sent you a chest!', giftOnce: 'Gifts are available once a day',
     eraProg: 'Era progress',
-    consentTitle: 'Terms & Privacy',
-    consentBody: 'Age rating: 0+.\nWe process the minimum data: your VK profile id and first name (for saves and the friends leaderboard) and game progress in VK cloud storage. Ads use only VK platform mechanisms; rewards are granted on your tap only. Full texts: the user agreement and privacy policy in the game card and in settings.',
-    consentAccept: 'Accept & play', consentDecline: 'Decline',
-    consentBlocked: 'Without accepting the terms and privacy policy the game cannot be accessed (platform rule 1.1.4).',
-    consentReopen: 'Open the terms again', consentInSettings: 'Terms & privacy',
     authTitle: 'Launch from VK', authText: 'VK launch parameters could not be confirmed (vk_sign missing). Open the game from the VK games catalog or refresh the page.',
     authRetry: 'Retry', giftSent: 'Gift sent! Your friend gets a chest on launch.',
     inviteReward: 'When a friend launches the game via your invite, you get a legendary wonder charge'
@@ -1896,7 +1884,10 @@ var VK = (function () {
       if (done) return; done = true;
       try { onDone(rewarded, !!simulated); } catch (e) {}
     }
-    if (!bridge()) { log('reward: no bridge → simulate'); setTimeout(function () { finish(true, true); }, 350); return; }
+    /* AUDIT2 F-E [B5/P2]: вне VK (top-level окно / адблок / прямой заход) мост не ответит никогда —
+       награду симулируем сразу, а не через guard 25 сек */
+    var br = bridge();
+    if (!br || (typeof br.isEmbedded === 'function' && !br.isEmbedded())) { log('reward: not embedded → simulate'); setTimeout(function () { finish(true, true); }, 350); return; }
     pendingReward = finish;
     var guard = setTimeout(function () {
       if (pendingReward === finish) { pendingReward = null; log('reward: timeout → grant'); finish(true, true); }
@@ -2045,7 +2036,12 @@ var Sound = (function () {
   }
 
   function ensure() {
-    if (ctx) { if (ctx.state === 'suspended') ctx.resume().catch(function () {}); return true; }
+    if (ctx) {
+      if (ctx.state === 'suspended') ctx.resume().catch(function () {});
+      /* AUDIT2 F-F [B8/P3]: луп, созданный до первого жеста (autoplay-блок браузера), оживает на жесте */
+      if (curLoop && curLoop.paused && enabled && musicEnabled && !extPaused) { try { curLoop.play().catch(function () {}); } catch (e2) {} }
+      return true;
+    }
     try {
       var AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return false;
@@ -2578,6 +2574,7 @@ function calcOffline() {
 /* ============================================================ СОХРАНЕНИЕ */
 var saveTimer = 0;
 var lastCloudPush = 0;
+var lastCloudSave = 0;
 function save(force) {
   if (!S) return;
   S.lastSave = Date.now();
@@ -2586,7 +2583,8 @@ function save(force) {
   try { localStorage.setItem(SAVE_KEY, json); } catch (e) {}
   /* AUDIT F11 [B13/P3]: периодический облачный sync раз в 60 сек + форс */
   if (force || Date.now() - lastCloudPush > 60000) { lastCloudPush = Date.now(); lbPushCloud(); }
-  VK.cloudWrite('ages_save_v1', compressSave(json));
+  /* AUDIT2 F-G [B4/P3]: фоновая облачная запись не чаще 15 сек (бережём частотные лимиты VK storage); форс-сейвы пишут сразу */
+  if (force || Date.now() - lastCloudSave > 15000) { lastCloudSave = Date.now(); VK.cloudWrite('ages_save_v1', compressSave(json)); }
 }
 function compressSave(json) {
   // облако VK ограничено по размеру — пишем компактную версию
@@ -2630,6 +2628,20 @@ function mergeState(o) {
   if (!Array.isArray(d.eraStars) || d.eraStars.length !== 7) d.eraStars = [0, 0, 0, 0, 0, 0, 0];
   if (!Array.isArray(d.prestigesInEra) || d.prestigesInEra.length !== 7) d.prestigesInEra = [0, 0, 0, 0, 0, 0, 0];
   if (!Array.isArray(d.crisisDone)) d.crisisDone = [];
+  /* AUDIT2 F-R [B4/P2]: санитизация чисел из старых/битых/правленых сейвов — NaN не должен ломать экономику */
+  function saneNum(v, def) { v = Number(v); return isFinite(v) ? v : def; }
+  d.res = Math.max(0, saneNum(d.res, 0));
+  d.totalRes = Math.max(0, saneNum(d.totalRes, 0));
+  d.resRun = Math.max(0, saneNum(d.resRun, 0));
+  d.clicks = Math.max(0, Math.floor(saneNum(d.clicks, 0)));
+  d.prestige = Math.max(0, Math.floor(saneNum(d.prestige, 0)));
+  d.chestQueue = Math.max(0, Math.floor(saneNum(d.chestQueue, 0)));
+  d.boost2xUntil = Math.max(0, saneNum(d.boost2xUntil, 0));
+  d.freeChestNext = Math.max(0, saneNum(d.freeChestNext, 0));
+  for (var bk in d.buildings) {
+    var bl = Math.floor(saneNum(d.buildings[bk], 0));
+    if (bl > 0) d.buildings[bk] = bl; else delete d.buildings[bk];
+  }
   return d;
 }
 
@@ -3836,7 +3848,7 @@ UI.adGate = function (cb) {
   Sound.ensure();
   UI.modal({
     icon: 'ad', title: T('adWatch'),
-    sub: T('adNoFill') && !VK.available ? (LANG === 'ru' ? 'Без VK Bridge награда выдаётся сразу' : 'Without VK Bridge the reward is granted instantly') : '',
+    sub: (!VK.available || (window.vkBridge && typeof window.vkBridge.isEmbedded === 'function' && !window.vkBridge.isEmbedded())) ? (LANG === 'ru' ? 'Без VK Bridge награда выдаётся сразу' : 'Without VK Bridge the reward is granted instantly') : '',
     buttons: [
       { t: T('cancel') },
       { t: T('adWatch'), icon: '▶', primary: true, fn: function () {
@@ -4008,37 +4020,6 @@ UI.openFreeChest = function () {
   });
 };
 
-/* v3.3 (1.1.4, 2.1.5): гейт согласия с соглашением и политикой конфиденциальности */
-UI.showConsentGate = function () {
-  var ov = document.createElement('div');
-  ov.id = 'consentGate';
-  ov.innerHTML =
-    '<div class="modal consent-modal">' +
-    '<h3>' + T('consentTitle') + '</h3>' +
-    '<div class="m-body consent-body"><div class="m-sub" style="text-align:left;white-space:pre-line">' + T('consentBody') + '</div></div>' +
-    '<div class="m-row"><button class="pill" id="btnConsentDecline">' + T('consentDecline') + '</button>' +
-    '<button class="pill pill-gold" id="btnConsentAccept">' + T('consentAccept') + '</button></div></div>';
-  document.getElementById('app').appendChild(ov);
-  document.getElementById('btnConsentAccept').addEventListener('click', function () {
-    S.flags.consent = 1;
-    Sound.sfx('ui');
-    if (ov.parentNode) ov.parentNode.removeChild(ov);
-    VK.track('consent_accept', {});
-    save(true);
-  });
-  document.getElementById('btnConsentDecline').addEventListener('click', function () {
-    Sound.sfx('deny');
-    var m = ov.querySelector('.modal');
-    m.innerHTML =
-      '<h3>' + T('consentTitle') + '</h3>' +
-      '<div class="m-body consent-body"><div class="m-sub">' + T('consentBlocked') + '</div></div>' +
-      '<div class="m-row"><button class="pill pill-gold" id="btnConsentReopen">' + T('consentReopen') + '</button></div>';
-    document.getElementById('btnConsentReopen').addEventListener('click', function () {
-      if (ov.parentNode) ov.parentNode.removeChild(ov);
-      UI.showConsentGate();
-    });
-  });
-};
 /* v3.3 (1.2.2): заглушка, если игра внутри VK, но подписи параметров запуска нет */
 UI.showAuthStub = function () {
   var ov = document.createElement('div');
@@ -4860,15 +4841,6 @@ UI.renderSettings = function () {
     (LANG === 'ru' ? 'Престижей: ' : 'Prestiges: ') + S.prestige + '<br>' +
     (LANG === 'ru' ? 'Рекламы посмотрено: ' : 'Ads watched: ') + S.stats.adsWatched;
   r7.appendChild(st);
-  /* v3.3: соглашение и политика в настройках */
-  var r10 = row('<b>' + T('consentInSettings') + '<span>0+ · ' + (LANG === 'ru' ? 'тексты в карточке игры' : 'full texts in the store card') + '</span></b>');
-  var b10 = document.createElement('button');
-  b10.className = 'pill pill-sm';
-  b10.innerHTML = '<span>' + T('consentTitle') + '</span>';
-  b10.addEventListener('click', function () {
-    UI.modal({ title: T('consentTitle'), body: '<div class="m-body consent-body"><div class="m-sub" style="text-align:left;white-space:pre-line">' + T('consentBody') + '</div></div>', wide: true, buttons: [{ t: T('ok'), primary: true }] });
-  });
-  r10.appendChild(b10);
   /* сброс */
   var r8 = row('<b style="color:#ff9db0">' + T('reset') + '</b>');
   var b8 = document.createElement('button');
@@ -5074,7 +5046,10 @@ UI.showWin = function () {
       var r = rps();
       if (r > 0) addRes(r * dt, 'passive');
       /* авто-клик */
-      var ac = autoclicks();
+      /* AUDIT2 F-C [B3/P1]: кризис и авто-клик замирают, пока открыта модалка/реклама —
+         игрок не наказывается таймером за добровольную рекламу */
+      var crisisFrozen = !!Crisis.active && !!UI.modalEl;
+      var ac = crisisFrozen ? 0 : autoclicks();
       if (ac > 0) {
         while (acc >= 1 / Math.max(0.5, ac)) {
           acc -= 1 / Math.max(0.5, ac);
@@ -5082,7 +5057,7 @@ UI.showWin = function () {
         }
       } else acc = 0;
       /* кризис */
-      if (Crisis.active) Crisis.tick(dt);
+      if (Crisis.active && !crisisFrozen) Crisis.tick(dt);
       /* счётчики UI (v2: dt для одометра) + эмбиент-частицы эпохи */
       UI.updateCounters(dt);
       ambAcc += dt;
@@ -5212,7 +5187,8 @@ UI.showWin = function () {
       VK.track('gift_received', {});
       save(true);
     }
-    if (VK.launch && VK.launch.requestKey) {
+    /* AUDIT2 F-D [B12/P2]: gift_-запуск уже дал сундук выше — награда приглашения не дублируется */
+    if (VK.launch && VK.launch.requestKey && VK.launch.requestKey.indexOf('gift_') !== 0) {
       S.invitePending++;
       S.legendaryCharges++;
       UI.toast('👥 ' + (LANG === 'ru' ? 'Тебя пригласили! +заряд легендарного чуда' : 'You were invited! +legendary wonder charge'), 'gold', 3000);
@@ -5226,9 +5202,6 @@ UI.showWin = function () {
         VK.track('auth_fail', {});
         return;
       }
-      /* v3.3 (1.1.4): доступ только после принятия соглашения и политики */
-      if (!S.flags.consent) { UI.showConsentGate(); }
-
       /* офлайн-доход */
       E.applyOffline(function (info) {
         if (hasSave && info && info.amount > 0) UI.showOffline(info);
@@ -5352,6 +5325,8 @@ UI.showWin = function () {
     window.addEventListener('keydown', function (e) {
       if (e.code === 'Space' || e.key === ' ') {
         e.preventDefault();
+        /* AUDIT2 F-J [B6/P2]: пробел не должен тапать сквозь открытую модалку */
+        if (UI.modalEl) return;
         if (UI.screen === 'start') { document.getElementById('btnStart').click(); return; }
         if (UI.screen !== 'main' && UI.screen !== 'crisis') return;
         var el = document.getElementById(Crisis.active ? 'crisisTapBtn' : 'tapBtn');
@@ -5386,9 +5361,10 @@ UI.showWin = function () {
       save(true);
       E.setPaused(true);
     } else {
+      /* AUDIT2 F-B [B9/P2]: фон доначисляем ДО сброса lastTs внутри setPaused(false), иначе начисление всегда 0 */
+      var info = calcOffline();
       E.setPaused(false);
       /* доначисляем пассив за время фона (timestamp-based) */
-      var info = calcOffline();
       if (info.sec > 5 && info.amount > 0) {
         addRes(info.amount, 'background');
         S.lastTs = Date.now();
