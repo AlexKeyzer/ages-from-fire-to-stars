@@ -657,6 +657,17 @@ body.lowfx .intro-slide { filter: none; }
 
 /* ============================== v3.3 COMPLIANCE ========================== */
 #authStub { position: absolute; inset: 0; z-index: 96; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(6,4,14,.72); }
+/* v3.4.2: счётчик секунд до награды во время rewarded-сессии */
+#adTimer { position: fixed; left: 50%; top: calc(10px + env(safe-area-inset-top, 0px)); transform: translateX(-50%); z-index: 98; display: none; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; background: rgba(10,8,24,.86); border: 1px solid rgba(255,255,255,.28); backdrop-filter: blur(6px); font-weight: 800; font-size: 14px; color: #fff; box-shadow: 0 6px 18px rgba(0,0,0,.35); pointer-events: none; }
+#adTimer.show { display: flex; }
+#adTimer .at-ic { width: 18px; height: 18px; flex: 0 0 auto; }
+#adTimer .at-txt { white-space: nowrap; font-variant-numeric: tabular-nums; }
+#adTimer .at-bar { width: 64px; height: 6px; border-radius: 4px; background: rgba(255,255,255,.18); overflow: hidden; }
+#adTimer .at-bar i { display: block; height: 100%; width: 100%; background: #ffd166; border-radius: 4px; transition: width .25s linear; }
+#adTimer.bad { border-color: #ff8095; color: #ffd7dd; }
+#adTimer.bad .at-bar i { background: #ff8095; }
+#adTimer.ok { border-color: #8dffa8; color: #d9ffe6; }
+#adTimer.ok .at-bar i { background: #8dffa8; }
 
 </style>
 </head>
@@ -1506,6 +1517,10 @@ var I18N = {
     adNoFill: 'Реклама сейчас недоступна — попробуй позже',
     adNotWatched: 'Награда начисляется за полный просмотр рекламы (~30 сек)',
     adNotInVk: 'Реклама доступна в клиенте VK — награда начисляется только за просмотр',
+    adTimerLeft: 'Награда через: {n} с',
+    adTimerGot: 'Награда получена!',
+    adTimerEarly: 'Ролик закрыт на {a} с из {b} — без награды',
+    adTimerNoVerify: 'Не удалось подтвердить просмотр — без награды',
     techsAllBought: 'Все технологии эпохи открыты!',
     notEnough: 'Не хватает ресурса', eraDone: 'Эпоха пройдена',
     winTitle: 'Ты прошёл все 7 эпох!', winDesc: 'Цивилизация достигла звёзд. Престиж доступен бесконечно — гонись за 3★ во всех ветках.',
@@ -1587,6 +1602,10 @@ var I18N = {
     adNoFill: 'No ads available right now — try later',
     adNotWatched: 'The reward is granted after watching the ad in full (~30 sec)',
     adNotInVk: 'Ads are available in the VK client app — the reward is granted for watching only',
+    adTimerLeft: 'Reward in {n} s',
+    adTimerGot: 'Reward received!',
+    adTimerEarly: 'Closed at {a}s of {b}s — no reward',
+    adTimerNoVerify: 'Could not verify the ad watch — no reward',
     techsAllBought: 'All era technologies unlocked!',
     notEnough: 'Not enough resource', eraDone: 'Era complete',
     winTitle: 'You cleared all 7 eras!', winDesc: 'Your civilisation reached the stars. Prestige is endless — chase 3★ in every branch.',
@@ -1900,6 +1919,8 @@ var VK = (function () {
       if (done) return; done = true;
       clearH();
       log('reward finish: rewarded=' + !!rewarded + ' reason=' + reason);
+      /* v3.4.2: уведомляем UI о завершении сессии (для счётчика до награды) */
+      try { if (typeof api.onAdFinish === 'function') api.onAdFinish(reason || '', shownAt ? Math.round((Date.now() - shownAt) / 1000) : 0); } catch (e) { /* hook */ }
       try { onDone(!!rewarded, !!simulated, reason || ''); } catch (e) {}
     }
     var br = bridge();
@@ -1923,6 +1944,8 @@ var VK = (function () {
       clearTimeout(openGuard);
       if (d && d.result === false) { log('reward: no fill → no grant'); finish(false, false, 'nofill'); return; }
       shownAt = Date.now();
+      /* v3.4.2: сессия стартовала — UI показывает счётчик секунд до награды */
+      try { if (typeof api.onAdShown === 'function') api.onAdShown(minWatch); } catch (e) { /* hook */ }
       setTimeout(function () { if (!done && shownAt) { log('reward: no session event → not verified'); finish(false, false, 'noverify'); } }, verifyMs);
     }).catch(function () {
       clearTimeout(openGuard);
@@ -3876,6 +3899,73 @@ UI.adDenyToast = function (reason) {
   var k = reason === 'early' ? 'adNotWatched' : reason === 'notvk' ? 'adNotInVk' : 'adNoFill';
   UI.toast(T(k), reason === 'early' ? 'bad' : '', 2600);
 };
+/* v3.4.2: счётчик секунд до награды — пилюля поверх интерфейса.
+   Стартует по хуку VK.onAdShown (ролик открыт), тикает 250 мс,
+   по VK.onAdFinish показывает исход: watched/early/noverify/nofill/error.
+   notvk — сессии нет, виджет не показывается (достаточно тоста). */
+UI.adTimer = {
+  el: null, iv: 0, t0: 0, minSec: 30, hideT: 0,
+  mount: function () {
+    if (this.el && this.el.parentNode) return this.el;
+    var el = document.createElement('div');
+    el.id = 'adTimer';
+    el.innerHTML = iconImg('ad', 'at-ic') + '<span class="at-txt"></span><span class="at-bar"><i></i></span>';
+    (document.getElementById('app') || document.body).appendChild(el);
+    this.el = el;
+    return el;
+  },
+  render: function () {
+    var self = UI.adTimer;
+    if (!self.el || !self.el.parentNode) return;
+    var left = Math.max(0, self.minSec - Math.floor((Date.now() - self.t0) / 1000));
+    var txt = self.el.querySelector('.at-txt');
+    if (txt) txt.textContent = T('adTimerLeft', { n: left });
+    var bar = self.el.querySelector('.at-bar i');
+    if (bar) bar.style.width = Math.max(0, Math.min(100, (left / self.minSec) * 100)) + '%';
+  },
+  start: function (minMs) {
+    var self = UI.adTimer;
+    clearTimeout(self.hideT);
+    self.minSec = Math.max(1, Math.round((minMs || 30000) / 1000));
+    self.t0 = Date.now();
+    var el = self.mount();
+    el.className = 'show';
+    self.render();
+    clearInterval(self.iv);
+    self.iv = setInterval(self.render, 250);
+  },
+  finish: function (reason, elapsedSec) {
+    var self = UI.adTimer;
+    clearInterval(self.iv); self.iv = 0;
+    clearTimeout(self.hideT);
+    if (!self.el || !self.el.parentNode) return;
+    var txt = self.el.querySelector('.at-txt'), bar = self.el.querySelector('.at-bar i'), hideMs = 2600;
+    if (reason === 'watched') {
+      self.el.className = 'show ok';
+      if (txt) txt.textContent = T('adTimerGot');
+      if (bar) bar.style.width = '100%';
+      hideMs = 1800;
+    } else if (reason === 'early') {
+      self.el.className = 'show bad';
+      if (txt) txt.textContent = T('adTimerEarly', { a: Math.max(0, Math.min(elapsedSec || 0, self.minSec)), b: self.minSec });
+      hideMs = 3000;
+    } else if (reason === 'noverify') {
+      self.el.className = 'show bad';
+      if (txt) txt.textContent = T('adTimerNoVerify');
+      hideMs = 3000;
+    } else if (reason === 'nofill' || reason === 'error') {
+      self.el.className = 'show bad';
+      if (txt) txt.textContent = T('adNoFill');
+      hideMs = 2200;
+    } else {
+      self.el.className = '';
+      return;
+    }
+    self.hideT = setTimeout(function () { if (UI.adTimer.el) UI.adTimer.el.className = ''; }, hideMs);
+  }
+};
+VK.onAdShown = function (minMs) { UI.adTimer.start(minMs); };
+VK.onAdFinish = function (reason, elapsedSec) { UI.adTimer.finish(reason, elapsedSec); };
 UI.adGate = function (cb) {
   Sound.ensure();
   UI.modal({
