@@ -1146,7 +1146,8 @@ var GAME = {
   INTERSTITIAL_COOLDOWN: 180000,  // мс
   INTERSTITIAL_LOCK_FIRST: 60000, // мс — запрет первые 60 сек
   /* v3.4: rewarded-награда только за фактический просмотр ролика */
-  AD_MIN_WATCH_MS: 30000,         // минимальное время просмотра rewarded (мс)
+  AD_MIN_WATCH_MS: 30000,         // отсчёт счётчика до награды (мс)
+  AD_FULL_MS: 15000,              // v3.6: минимальная длительность ДОСМОТРЕННОГО rewarded-ролика (мс)
   AD_VERIFY_MS: 60000,            // окно ожидания итогового события сессии; нет события → просмотр не верифицирован → без награды (мс)
   BOOST2X_TIME: 600000,           // 10 минут ×2 дохода (rewarded)
   FREE_CHEST_FIRST: 900000,       // первый бонус-сундук через 15 минут (D1-крюк)
@@ -1918,23 +1919,27 @@ var VK = (function () {
     }
   });
 
-  /* Показать rewarded. onDone(rewarded:boolean, simulated:boolean) */
-  /* v3.4.1 (требование владельца): «закрыл сразу → засчиталось» НЕДОПУСТИМО.
-     Награда выдаётся ТОЛЬКО за верифицированный просмотр: итоговое событие сессии
-     VKWebAppShowNativeAdsResult (без request_id) при elapsed ≥ AD_MIN_WATCH_MS.
-     Конверт-ответ открытия (data.request_id, приходит синхронно с резолвом send, первые ~3 сек)
-     игнорируется по reqAt — иначе elapsed считался от эпохи и гейт проходился мгновенно (баг v3.4).
-     Всё остальное — БЕЗ награды и БЕЗ списания дневной попытки (можно повторить позже):
-     раннее закрытие ('early'), нет итогового события за AD_VERIFY_MS ('noverify'),
-     нет филла ('nofill'), сбой показа/отправки ('error').
-     v3.5: вне VK — тестовый режим: собственный отсчёт AD_MIN_WATCH_MS со стеной-заглушкой,
-     награда только досидевшему до конца (simulated=true), раннее закрытие — 'early'.
-     v3.5.1: счётчик стартует с момента подтверждения просмотра (до open-ack) — виден весь ролик
-     даже в клиентах, где send() резолвится при закрытии (VK Web); «тихий» клиент с поздним
-     резолвом (≥ minWatch от подтверждения) грантится по резолву; openGuard = AD_VERIFY_MS. */
+  /* Показать rewarded. onDone(rewarded:boolean, simulated:boolean)
+     v3.6 (требование владельца: «награда сразу после просмотра»): time-first семантика.
+     Платформа VK не отдаёт надёжный флаг «досмотрено» (типы vk-bridge 3.0.2: payload событий
+     недокументирован), а rewarded-ролики бывают 15–30 с, поэтому конец сессии (событие или резолв
+     send) классифицируется по времени от подтверждения: ≥ AD_FULL_MS (15 с) → 'watched' и награда
+     СРАЗУ; 3 с..fullMs → 'early' (закрыл рано); <3 с при result:false → 'nofill'.
+     Полностью «тихий» клиент (ни событий, ни резолва): при признаке открытия (конверт с request_id
+     или document.hidden во время сессии) грантим по завершении отсчёта +2 с (deadline);
+     без признаков открытия за AD_VERIFY_MS → 'noverify' без награды.
+     «Закрыл сразу» (<15 с) не грантится никогда. Вне VK — тест-режим v3.5 (стена + отсчёт).
+     История: v3.4.1 ввела строгость («закрыл сразу → засчиталось» недопустимо); v3.5 — тест-режим
+     вне VK; v3.5.1 — счётчик с момента подтверждения; v3.6 — time-first: прежнее правило
+     «итоговое событие при elapsed ≥ AD_MIN_WATCH_MS» отклоняло ПОЛНОСТЬЮ досмотренные короткие
+     ролики 15–20 с (кейс владельца в VK Web: просмотрел, награды не было). */
   api.reward = function (onDone) {
     var done = false;
-    var clearH = function () { rewardEvent = null; rewardFailed = null; };
+    var clearH = function () {
+      rewardEvent = null; rewardFailed = null;
+      try { clearTimeout(deadline); } catch (e) {}
+      try { document.removeEventListener('visibilitychange', onVis); } catch (e) {}
+    };
     function finish(rewarded, simulated, reason) {
       if (done) return; done = true;
       clearH();
@@ -1959,34 +1964,45 @@ var VK = (function () {
     }
     var minWatch = (typeof GAME !== 'undefined' && GAME.AD_MIN_WATCH_MS) || 30000;
     var verifyMs = (typeof GAME !== 'undefined' && GAME.AD_VERIFY_MS) || 60000;
-    var reqAt = Date.now(), shownAt = 0;
-    /* v3.5.1: счётчик стартует с момента подтверждения, а не с open-ack: в части клиентов
-       (VK Web, десктоп) send() резолвится только при закрытии ролика, а у плеера платформы
-       нет секунд — пилюля «Награда через: N с» обязана быть видна весь просмотр
-       (плеер платформы не перекрывает верх страницы, см. скрин владельца). */
+    var fullMs = (typeof GAME !== 'undefined' && GAME.AD_FULL_MS) || 15000;
+    var reqAt = Date.now(), shownAt = 0, openEv = false;
+    /* v3.5.1: счётчик стартует с момента подтверждения, а не с open-ack (VK Web: send резолвится при закрытии) */
     try { if (typeof api.onAdShown === 'function') api.onAdShown(minWatch); } catch (e) { /* hook */ }
+    var onVis = function () { try { if (document.hidden) openEv = true; } catch (e) {} };
+    try { document.addEventListener('visibilitychange', onVis); } catch (e) {}
     rewardEvent = function (d) {
       if (done) return;
       var now = Date.now();
-      if (d && d.request_id !== undefined && (now - reqAt) < 3000) { log('reward: open envelope ignored'); return; }
-      if (!shownAt) { log('reward: result before open ack ignored'); return; }
-      var elapsed = now - shownAt;
-      log('reward: session result=' + !!(d && d.result) + ' elapsed=' + elapsed);
-      if (d && d.result !== false && elapsed >= minWatch - 1000) finish(true, false, 'watched');
+      if (d && d.request_id !== undefined && (now - reqAt) < 3000) { log('reward: open envelope ignored'); openEv = true; if (!shownAt) shownAt = now; return; }
+      openEv = true;
+      if (!shownAt) shownAt = now;
+      var elapsed = now - reqAt;
+      /* v3.6 time-first: платформа не отдаёт надёжный флаг «досмотрено», а ролики бывают 15–30 с.
+         Конец сессии ≥ fullMs = досмотрел → награда СРАЗУ; конец раньше fullMs = закрыл рано → без награды. */
+      log('reward: session event result=' + !!(d && d.result) + ' elapsed=' + elapsed + ' fullMs=' + fullMs);
+      if (elapsed >= fullMs) finish(true, false, 'watched');
       else finish(false, false, 'early');
     };
     rewardFailed = function () { if (!done) finish(false, false, 'error'); };
-    var openGuard = setTimeout(function () { if (!done) finish(false, false, 'error'); }, verifyMs);
+    var openGuard = setTimeout(function () { if (!done) finish(false, false, 'noverify'); }, verifyMs);
+    /* v3.6: полностью «тихий» клиент (ни событий, ни резолва): при наличии признака открытия
+       (конверт / скрытие страницы фуллскрином) грантим сразу по завершении отсчёта + 2 с. */
+    var deadline = setTimeout(function () {
+      if (!done && openEv) { log('reward: silent client, deadline with open evidence → watched'); finish(true, false, 'watched'); }
+    }, minWatch + 2000);
     send('VKWebAppShowNativeAds', { ad_format: 'reward', use_waterfall: true }).then(function (d) {
       clearTimeout(openGuard);
-      if (d && d.result === false) { log('reward: no fill → no grant'); finish(false, false, 'nofill'); return; }
-      /* v3.5.1: «тихий» клиент, у которого send резолвится при закрытии: резолв позже minWatch
-         от подтверждения — факт полного просмотра (в обычных клиентах резолв на открытии, <1 с). */
-      if (!done && (Date.now() - reqAt) >= minWatch) { log('reward: late resolve ≥ minWatch → watched'); finish(true, false, 'watched'); return; }
+      openEv = true;
+      var elapsed = Date.now() - reqAt;
+      if (d && d.result === false && elapsed < 3000) { log('reward: no fill → no grant'); finish(false, false, 'nofill'); return; }
+      /* v3.6: время резолва = диагноз: <3 с — open-ack; ≥ fullMs — закрытие досмотренного; между — закрыл рано */
+      if (elapsed >= fullMs) { log('reward: resolve ≥ fullMs → watched'); finish(true, false, 'watched'); return; }
+      if (elapsed >= 3000) { log('reward: resolve 3s..fullMs → early'); finish(false, false, 'early'); return; }
       shownAt = Date.now();
       setTimeout(function () { if (!done && shownAt) { log('reward: no session event → not verified'); finish(false, false, 'noverify'); } }, verifyMs);
     }).catch(function () {
       clearTimeout(openGuard);
+      clearTimeout(deadline);
       api.lastAdError = Date.now();
       log('reward: send error → no grant');
       finish(false, false, 'error');
@@ -3934,8 +3950,8 @@ UI.help = function (title, rows) {
 /* =============================================== REWARDED: 6 ТОЧЕК */
 /* v3.4.1: единая точка отказа награды — причина от VK.reward → честный тост, попытка не списана */
 UI.adDenyToast = function (reason) {
-  var k = reason === 'early' ? 'adNotWatched' : reason === 'notvk' ? 'adNotInVk' : 'adNoFill';
-  UI.toast(T(k), reason === 'early' ? 'bad' : '', 2600);
+  var k = reason === 'early' ? 'adNotWatched' : reason === 'notvk' ? 'adNotInVk' : reason === 'noverify' ? 'adTimerNoVerify' : 'adNoFill';
+  UI.toast(T(k), reason === 'early' || reason === 'noverify' ? 'bad' : '', 2600);
 };
 /* v3.4.2: счётчик секунд до награды — пилюля поверх интерфейса.
    Стартует по хуку VK.onAdShown (ролик открыт), тикает 250 мс,
