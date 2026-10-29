@@ -1129,7 +1129,7 @@ var GAME = {
   INTERSTITIAL_LOCK_FIRST: 60000, // мс — запрет первые 60 сек
   /* v3.4: rewarded-награда только за фактический просмотр ролика */
   AD_MIN_WATCH_MS: 30000,         // минимальное время просмотра rewarded (мс)
-  AD_SILENT_GRANT_MS: 35000,      // тихие клиенты без событий: грант после этого времени (мс)
+  AD_VERIFY_MS: 60000,            // окно ожидания итогового события сессии; нет события → просмотр не верифицирован → без награды (мс)
   BOOST2X_TIME: 600000,           // 10 минут ×2 дохода (rewarded)
   FREE_CHEST_FIRST: 900000,       // первый бонус-сундук через 15 минут (D1-крюк)
   FREE_CHEST_CD: 10800000         // далее каждые 3 часа
@@ -1505,6 +1505,7 @@ var I18N = {
     whyIncome: 'Откуда доход?', page: 'Стр. {a}/{b}',
     adNoFill: 'Реклама сейчас недоступна — попробуй позже',
     adNotWatched: 'Награда начисляется за полный просмотр рекламы (~30 сек)',
+    adNotInVk: 'Реклама доступна в клиенте VK — награда начисляется только за просмотр',
     techsAllBought: 'Все технологии эпохи открыты!',
     notEnough: 'Не хватает ресурса', eraDone: 'Эпоха пройдена',
     winTitle: 'Ты прошёл все 7 эпох!', winDesc: 'Цивилизация достигла звёзд. Престиж доступен бесконечно — гонись за 3★ во всех ветках.',
@@ -1585,6 +1586,7 @@ var I18N = {
     whyIncome: 'Where does income come from?', page: 'Page {a}/{b}',
     adNoFill: 'No ads available right now — try later',
     adNotWatched: 'The reward is granted after watching the ad in full (~30 sec)',
+    adNotInVk: 'Ads are available in the VK client app — the reward is granted for watching only',
     techsAllBought: 'All era technologies unlocked!',
     notEnough: 'Not enough resource', eraDone: 'Era complete',
     winTitle: 'You cleared all 7 eras!', winDesc: 'Your civilisation reached the stars. Prestige is endless — chase 3★ in every branch.',
@@ -1883,50 +1885,50 @@ var VK = (function () {
   });
 
   /* Показать rewarded. onDone(rewarded:boolean, simulated:boolean) */
-  /* v3.4 (требование владельца): награда — ТОЛЬКО за фактический просмотр (~30 сек).
-     Сигналы (документированные vk-bridge 3.x): ответ VKWebAppShowNativeAds {result:true} = ролик открыт;
-     событие VKWebAppShowNativeAdsResult = итог сессии (data.result); VKWebAppShowNativeAdsFailed = сбой показа.
-     Конверт-ответ открытия (data.request_id, приходит в первые ~2 сек) игнорируется.
-     Раннее закрытие (итог до AD_MIN_WATCH_MS) → награды НЕТ; тихие клиенты без событий → грант на AD_SILENT_GRANT_MS.
-     Ошибка показа / нет филла / вне VK → фолбэк-грант (правила платформы: награда при сбое показа). */
+  /* v3.4.1 (требование владельца): «закрыл сразу → засчиталось» НЕДОПУСТИМО.
+     Награда выдаётся ТОЛЬКО за верифицированный просмотр: итоговое событие сессии
+     VKWebAppShowNativeAdsResult (без request_id) при elapsed ≥ AD_MIN_WATCH_MS.
+     Конверт-ответ открытия (data.request_id, приходит синхронно с резолвом send, первые ~3 сек)
+     игнорируется по reqAt — иначе elapsed считался от эпохи и гейт проходился мгновенно (баг v3.4).
+     Всё остальное — БЕЗ награды и БЕЗ списания дневной попытки (можно повторить позже):
+     раннее закрытие ('early'), нет итогового события за AD_VERIFY_MS ('noverify'),
+     нет филла ('nofill'), сбой показа/отправки ('error'), вне VK ('notvk'). */
   api.reward = function (onDone) {
     var done = false;
-    var unsubHandlers = function () { rewardEvent = null; rewardFailed = null; };
-    function finish(rewarded, simulated) {
+    var clearH = function () { rewardEvent = null; rewardFailed = null; };
+    function finish(rewarded, simulated, reason) {
       if (done) return; done = true;
-      unsubHandlers();
-      try { onDone(rewarded, !!simulated); } catch (e) {}
+      clearH();
+      log('reward finish: rewarded=' + !!rewarded + ' reason=' + reason);
+      try { onDone(!!rewarded, !!simulated, reason || ''); } catch (e) {}
     }
-    /* AUDIT2 F-E [B5/P2]: вне VK (top-level окно / адблок / прямой заход) мост не ответит никогда —
-       награду симулируем сразу, а не через guard 25 сек */
     var br = bridge();
-    if (!br || (typeof br.isEmbedded === 'function' && !br.isEmbedded())) { log('reward: not embedded → simulate'); setTimeout(function () { finish(true, true); }, 350); return; }
+    if (!br || (typeof br.isEmbedded === 'function' && !br.isEmbedded())) { log('reward: not embedded → no grant'); setTimeout(function () { finish(false, false, 'notvk'); }, 200); return; }
     var minWatch = (typeof GAME !== 'undefined' && GAME.AD_MIN_WATCH_MS) || 30000;
-    var silentAt = (typeof GAME !== 'undefined' && GAME.AD_SILENT_GRANT_MS) || 35000;
-    var shownAt = 0;
+    var verifyMs = (typeof GAME !== 'undefined' && GAME.AD_VERIFY_MS) || 60000;
+    var reqAt = Date.now(), shownAt = 0;
     rewardEvent = function (d) {
       if (done) return;
-      var elapsed = Date.now() - shownAt;
-      /* конверт-ответ открытия: request_id + первые 2 сек — не итог сессии */
-      if (d && d.request_id !== undefined && shownAt && elapsed < 2000) { log('reward: open envelope ignored'); return; }
+      var now = Date.now();
+      if (d && d.request_id !== undefined && (now - reqAt) < 3000) { log('reward: open envelope ignored'); return; }
+      if (!shownAt) { log('reward: result before open ack ignored'); return; }
+      var elapsed = now - shownAt;
       log('reward: session result=' + !!(d && d.result) + ' elapsed=' + elapsed);
-      if (d && d.result === true && elapsed >= minWatch - 1000) finish(true, false);
-      else finish(false, false);   /* раннее закрытие / скип — награды нет */
+      if (d && d.result !== false && elapsed >= minWatch - 1000) finish(true, false, 'watched');
+      else finish(false, false, 'early');
     };
-    rewardFailed = function () { if (!done) { log('reward: failed event → fallback grant'); finish(true, true); } };
-    var openGuard = setTimeout(function () { log('reward: open timeout → fallback grant'); finish(true, true); }, 25000);
+    rewardFailed = function () { if (!done) finish(false, false, 'error'); };
+    var openGuard = setTimeout(function () { if (!done) finish(false, false, 'error'); }, 25000);
     send('VKWebAppShowNativeAds', { ad_format: 'reward', use_waterfall: true }).then(function (d) {
       clearTimeout(openGuard);
-      if (d && d.result === false) { log('reward: no fill → simulate'); finish(true, true); return; }
+      if (d && d.result === false) { log('reward: no fill → no grant'); finish(false, false, 'nofill'); return; }
       shownAt = Date.now();
-      setTimeout(function () {
-        if (!done && shownAt) { log('reward: silent client → grant after silent window'); finish(true, false); }
-      }, silentAt);
+      setTimeout(function () { if (!done && shownAt) { log('reward: no session event → not verified'); finish(false, false, 'noverify'); } }, verifyMs);
     }).catch(function () {
       clearTimeout(openGuard);
       api.lastAdError = Date.now();
-      log('reward: send error → fallback grant');
-      finish(true, true);
+      log('reward: send error → no grant');
+      finish(false, false, 'error');
     });
   };
 
@@ -3869,17 +3871,22 @@ UI.help = function (title, rows) {
 };
 
 /* =============================================== REWARDED: 6 ТОЧЕК */
+/* v3.4.1: единая точка отказа награды — причина от VK.reward → честный тост, попытка не списана */
+UI.adDenyToast = function (reason) {
+  var k = reason === 'early' ? 'adNotWatched' : reason === 'notvk' ? 'adNotInVk' : 'adNoFill';
+  UI.toast(T(k), reason === 'early' ? 'bad' : '', 2600);
+};
 UI.adGate = function (cb) {
   Sound.ensure();
   UI.modal({
     icon: 'ad', title: T('adWatch'),
-    sub: (!VK.available || (window.vkBridge && typeof window.vkBridge.isEmbedded === 'function' && !window.vkBridge.isEmbedded())) ? (LANG === 'ru' ? 'Без VK Bridge награда выдаётся сразу' : 'Without VK Bridge the reward is granted instantly') : '',
+    sub: (window.vkBridge && typeof window.vkBridge.isEmbedded === 'function' && !window.vkBridge.isEmbedded()) ? T('adNotInVk') : '',
     buttons: [
       { t: T('cancel') },
       { t: T('adWatch'), icon: '▶', primary: true, fn: function () {
         UI.toast(LANG === 'ru' ? 'Реклама…' : 'Ad…', '', 1200);
-        VK.reward(function (ok, sim) {
-          if (!ok) { UI.toast(T('adNotWatched'), 'bad', 2400); cb(false, false); return; }
+        VK.reward(function (ok, sim, reason) {
+          if (!ok) { UI.adDenyToast(reason); cb(false, false); return; }
           S.stats.adsWatched++;
           VK.track('ad_watch', { point: 'instant_tech', sim: !!sim });
           cb(!!ok, !!sim);
@@ -3902,8 +3909,8 @@ UI.showOffline = function (info) {
     buttons: [
       { t: T('offlineTake'), fn: function () { addRes(amount, 'offline'); Sound.sfx('coin'); FX.coins(window.innerWidth / 2, window.innerHeight / 2, 16); questProgress('offline', 1); UI.needRefresh = true; } },
       { t: T('offlineDouble'), icon: '🎬', ad: true, primary: true, fn: function () {
-        VK.reward(function (ok) {
-          if (!ok) { UI.toast(T('adNotWatched'), 'bad', 2400); return; }
+        VK.reward(function (ok, sim, reason) {
+          if (!ok) { UI.adDenyToast(reason); return; }
           S.stats.adsWatched++;
           VK.track('ad_watch', { point: 'offline_x2' });
           var total = amount * 2;
@@ -3930,8 +3937,8 @@ UI.adBoost2x = function () {
     buttons: [
       { t: T('cancel') },
       { t: T('adWatch'), icon: '🎬', primary: true, fn: function () {
-        VK.reward(function (ok) {
-          if (!ok) { UI.toast(T('adNotWatched'), 'bad', 2400); return; }
+        VK.reward(function (ok, sim, reason) {
+          if (!ok) { UI.adDenyToast(reason); return; }
           S.stats.adsWatched++;
           VK.track('ad_watch', { point: 'boost2x' });
           S.ads.boost2x++;
@@ -3954,8 +3961,8 @@ UI.adCrisisHelp = function () {
     buttons: [
       { t: T('cancel') },
       { t: T('adWatch'), icon: '🎬', primary: true, fn: function () {
-        VK.reward(function (ok) {
-          if (!ok) { UI.toast(T('adNotWatched'), 'bad', 2400); return; }
+        VK.reward(function (ok, sim, reason) {
+          if (!ok) { UI.adDenyToast(reason); return; }
           S.stats.adsWatched++;
           VK.track('ad_watch', { point: 'crisis_help' });
           c.help = true;
@@ -3978,8 +3985,8 @@ UI.adDailyChest = function () {
     buttons: [
       { t: T('cancel') },
       { t: T('adWatch'), icon: '🎬', primary: true, fn: function () {
-        VK.reward(function (ok) {
-          if (!ok) { UI.toast(T('adNotWatched'), 'bad', 2400); return; }
+        VK.reward(function (ok, sim, reason) {
+          if (!ok) { UI.adDenyToast(reason); return; }
           S.stats.adsWatched++;
           VK.track('ad_watch', { point: 'daily_chest' });
           S.daily.adChest++;
@@ -4001,8 +4008,8 @@ UI.showCrisisWin = function (payout, c) {
     buttons: [
       { t: c.doubled ? T('ok') : T('chest'), primary: !c.doubled, fn: function () { if (!c.doubled) UI.openChestModal(); } },
       c.doubled ? null : { t: T('adDoubleCrisis'), icon: '🎬', ad: true, primary: true, fn: function () {
-        VK.reward(function (ok) {
-          if (!ok) { UI.toast(T('adNotWatched'), 'bad', 2400); return; }
+        VK.reward(function (ok, sim, reason) {
+          if (!ok) { UI.adDenyToast(reason); return; }
           S.stats.adsWatched++;
           VK.track('ad_watch', { point: 'crisis_x2' });
           c.doubled = true;
@@ -4040,8 +4047,8 @@ UI.openFreeChest = function () {
     buttons: [
       { t: T('offlineTake'), fn: function () { E.claimFreeChest(false); UI.openChestModal({ force: true }); } },
       { t: T('freeChestDouble'), icon: '🎬', ad: true, primary: true, fn: function () {
-        VK.reward(function (ok) {
-          if (!ok) { UI.toast(T('adNotWatched'), 'bad', 2400); return; }
+        VK.reward(function (ok, sim, reason) {
+          if (!ok) { UI.adDenyToast(reason); return; }
           S.stats.adsWatched++;
           VK.track('ad_watch', { point: 'free_chest_x2' });
           E.claimFreeChest(true);
@@ -5314,7 +5321,7 @@ UI.showWin = function () {
         icon: '🎬', title: T('adDoubleCrisis'),
         sub: LANG === 'ru' ? 'Удвоить награду за текущий кризис' : 'Double the reward for this crisis',
         buttons: [{ t: T('cancel') }, { t: T('adWatch'), icon: '🎬', primary: true, fn: function () {
-          VK.reward(function (ok) { if (!ok) { UI.toast(T('adNotWatched'), 'bad', 2400); return; } c.doubled = true; S.stats.adsWatched++; UI.toast('✅ ×2', 'gold'); document.getElementById('btnCrisisDouble').disabled = true; });
+          VK.reward(function (ok, sim, reason) { if (!ok) { UI.adDenyToast(reason); return; } c.doubled = true; S.stats.adsWatched++; UI.toast('✅ ×2', 'gold'); document.getElementById('btnCrisisDouble').disabled = true; });
         } }]
       });
     });
