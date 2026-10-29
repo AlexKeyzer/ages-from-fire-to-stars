@@ -668,6 +668,13 @@ body.lowfx .intro-slide { filter: none; }
 #adTimer.bad .at-bar i { background: #ff8095; }
 #adTimer.ok { border-color: #8dffa8; color: #d9ffe6; }
 #adTimer.ok .at-bar i { background: #8dffa8; }
+/* v3.5: стена-заглушка тестовой рекламы вне VK */
+#adSimWall { position: fixed; inset: 0; z-index: 97; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 14px; padding: 24px; background: radial-gradient(120% 90% at 50% 10%, rgba(38,26,74,.96), rgba(6,4,14,.97)); text-align: center; }
+#adSimWall.show { display: flex; }
+#adSimWall .sw-ic { width: 64px; height: 64px; }
+#adSimWall h3 { margin: 0; font-size: 18px; color: #fff; }
+#adSimWall .sw-sub { max-width: 330px; font-size: 13px; line-height: 1.45; color: rgba(255,255,255,.72); }
+#adSimWall .sw-close { margin-top: 12px; }
 
 </style>
 </head>
@@ -1521,6 +1528,9 @@ var I18N = {
     adTimerGot: 'Награда получена!',
     adTimerEarly: 'Ролик закрыт на {a} с из {b} — без награды',
     adTimerNoVerify: 'Не удалось подтвердить просмотр — без награды',
+    adSimTitle: 'Реклама · тестовый режим',
+    adSimSub: 'Вне VK рекламу заменяет отсчёт 30 секунд: досмотрел до конца — награда, закрыл раньше — без награды.',
+    adSimClose: 'Закрыть рекламу',
     techsAllBought: 'Все технологии эпохи открыты!',
     notEnough: 'Не хватает ресурса', eraDone: 'Эпоха пройдена',
     winTitle: 'Ты прошёл все 7 эпох!', winDesc: 'Цивилизация достигла звёзд. Престиж доступен бесконечно — гонись за 3★ во всех ветках.',
@@ -1606,6 +1616,9 @@ var I18N = {
     adTimerGot: 'Reward received!',
     adTimerEarly: 'Closed at {a}s of {b}s — no reward',
     adTimerNoVerify: 'Could not verify the ad watch — no reward',
+    adSimTitle: 'Ad · test mode',
+    adSimSub: 'Outside VK the ad is replaced by a 30-second countdown: finish it for the reward, close early for nothing.',
+    adSimClose: 'Close ad',
     techsAllBought: 'All era technologies unlocked!',
     notEnough: 'Not enough resource', eraDone: 'Era complete',
     winTitle: 'You cleared all 7 eras!', winDesc: 'Your civilisation reached the stars. Prestige is endless — chase 3★ in every branch.',
@@ -1911,7 +1924,9 @@ var VK = (function () {
      игнорируется по reqAt — иначе elapsed считался от эпохи и гейт проходился мгновенно (баг v3.4).
      Всё остальное — БЕЗ награды и БЕЗ списания дневной попытки (можно повторить позже):
      раннее закрытие ('early'), нет итогового события за AD_VERIFY_MS ('noverify'),
-     нет филла ('nofill'), сбой показа/отправки ('error'), вне VK ('notvk'). */
+     нет филла ('nofill'), сбой показа/отправки ('error').
+     v3.5: вне VK — тестовый режим: собственный отсчёт AD_MIN_WATCH_MS со стеной-заглушкой,
+     награда только досидевшему до конца (simulated=true), раннее закрытие — 'early'. */
   api.reward = function (onDone) {
     var done = false;
     var clearH = function () { rewardEvent = null; rewardFailed = null; };
@@ -1924,7 +1939,19 @@ var VK = (function () {
       try { onDone(!!rewarded, !!simulated, reason || ''); } catch (e) {}
     }
     var br = bridge();
-    if (!br || (typeof br.isEmbedded === 'function' && !br.isEmbedded())) { log('reward: not embedded → no grant'); setTimeout(function () { finish(false, false, 'notvk'); }, 200); return; }
+    if (!br || (typeof br.isEmbedded === 'function' && !br.isEmbedded())) {
+      /* v3.5 (решение владельца): вне VK — тестовый «просмотр»: собственный отсчёт minWatch.
+         Досидел до конца → награда (simulated=true); закрыл раньше (sim.cancel) → 'early' без награды,
+         попытка не списывается. Реальной рекламы вне VK нет, монетизация VK не затрагивается. */
+      var simMin = (typeof GAME !== 'undefined' && GAME.AD_MIN_WATCH_MS) || 30000;
+      log('reward: not embedded → sim watch ' + simMin + ' ms');
+      shownAt = Date.now();
+      var sim = { cancel: function () { if (!done) finish(false, false, 'early'); } };
+      try { if (typeof api.onAdSim === 'function') api.onAdSim(simMin, sim); } catch (e) { /* hook */ }
+      try { if (typeof api.onAdShown === 'function') api.onAdShown(simMin); } catch (e) { /* hook */ }
+      setTimeout(function () { if (!done) finish(true, true, 'watched'); }, simMin);
+      return;
+    }
     var minWatch = (typeof GAME !== 'undefined' && GAME.AD_MIN_WATCH_MS) || 30000;
     var verifyMs = (typeof GAME !== 'undefined' && GAME.AD_VERIFY_MS) || 60000;
     var reqAt = Date.now(), shownAt = 0;
@@ -3938,6 +3965,7 @@ UI.adTimer = {
     var self = UI.adTimer;
     clearInterval(self.iv); self.iv = 0;
     clearTimeout(self.hideT);
+    UI.adSimWall.hide();   /* v3.5: любой исход сессии убирает стену-заглушку */
     if (!self.el || !self.el.parentNode) return;
     var txt = self.el.querySelector('.at-txt'), bar = self.el.querySelector('.at-bar i'), hideMs = 2600;
     if (reason === 'watched') {
@@ -3966,11 +3994,40 @@ UI.adTimer = {
 };
 VK.onAdShown = function (minMs) { UI.adTimer.start(minMs); };
 VK.onAdFinish = function (reason, elapsedSec) { UI.adTimer.finish(reason, elapsedSec); };
+/* v3.5: тестовая реклама вне VK — стена-заглушка с кнопкой раннего закрытия */
+UI.adSimWall = {
+  el: null, sim: null,
+  show: function (sim) {
+    var self = UI.adSimWall;
+    if (!self.el || !self.el.parentNode) {
+      var el = document.createElement('div');
+      el.id = 'adSimWall';
+      el.innerHTML = iconImg('ad', 'sw-ic') + '<h3></h3><div class="sw-sub"></div><button class="pill sw-close"><span></span></button>';
+      (document.getElementById('app') || document.body).appendChild(el);
+      el.querySelector('.sw-close').addEventListener('click', function () {
+        Sound.sfx('ui');
+        if (self.sim && self.sim.cancel) self.sim.cancel();
+      });
+      self.el = el;
+    }
+    self.sim = sim || null;
+    self.el.querySelector('h3').textContent = T('adSimTitle');
+    self.el.querySelector('.sw-sub').textContent = T('adSimSub');
+    self.el.querySelector('.sw-close span').textContent = T('adSimClose');
+    self.el.classList.add('show');
+  },
+  hide: function () {
+    var self = UI.adSimWall;
+    self.sim = null;
+    if (self.el && self.el.parentNode) self.el.classList.remove('show');
+  }
+};
+VK.onAdSim = function (minMs, sim) { UI.adSimWall.show(sim); };
 UI.adGate = function (cb) {
   Sound.ensure();
   UI.modal({
     icon: 'ad', title: T('adWatch'),
-    sub: (window.vkBridge && typeof window.vkBridge.isEmbedded === 'function' && !window.vkBridge.isEmbedded()) ? T('adNotInVk') : '',
+    sub: (window.vkBridge && typeof window.vkBridge.isEmbedded === 'function' && window.vkBridge.isEmbedded()) ? '' : T('adSimSub'),
     buttons: [
       { t: T('cancel') },
       { t: T('adWatch'), icon: '▶', primary: true, fn: function () {
