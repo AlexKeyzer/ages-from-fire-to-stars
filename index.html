@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1764,15 +1765,18 @@ var VK = (function () {
     if (!b) { log('VK Bridge не найден — работаем автономно'); return Promise.resolve(false); }
     return send('VKWebAppInit').then(function () {
       api.ready = true;
-      try {
-        var p = new URLSearchParams(location.search);
-        api.launch = {
-          ref: p.get('vk_ref') || p.get('ref') || '',
-          requestKey: p.get('vk_request_key') || '',
-          appId: p.get('vk_app_id') || '',
-          platform: p.get('vk_platform') || ''
-        };
-      } catch (e) {}
+      /* v3.3.1 fix: параметры запуска (включая vk_sign!) читаем из query И hash,
+         ключи с префиксом vk_ и без; плюс фолбэк через мост (мобильные клиенты). */
+      api.launch = parseLaunch();
+      api.launchReady = new Promise(function (res) {
+        var done = false;
+        var fin = function () { if (!done) { done = true; res(true); } };
+        setTimeout(fin, 1500); /* страховка: мост может не ответить — не висим вечно */
+        send('VKWebAppGetLaunchParams', {}).then(function (d) {
+          if (d && typeof d === 'object') mergeLaunch(d);
+          fin();
+        }, function () { fin(); });
+      });
       // инфо о пользователе (не критично)
       send('VKWebAppGetUserInfo', {}).then(function (d) {
         api.user = d || null;
@@ -1781,6 +1785,62 @@ var VK = (function () {
       return true;
     }).catch(function (e) { log('init failed', e && e.error_type); return false; });
   };
+
+  /* -------------------------------------------------- параметры запуска */
+  /* VK передаёт vk_* в query, но часть клиентов/hash-роутинга кладёт их в hash
+     (вида #/?vk_app_id=… или #vk_app_id=…). Собираем оба источника. */
+  function launchQueryStrings() {
+    var out = [];
+    try {
+      var s = location.search || '';
+      out.push(s.charAt(0) === '?' ? s.slice(1) : s);
+      var h = location.hash || '';
+      if (h) {
+        h = h.charAt(0) === '#' ? h.slice(1) : h;
+        var qi = h.indexOf('?');
+        if (qi >= 0) out.push(h.slice(qi + 1));
+        else if (h.indexOf('vk_') === 0 || h.indexOf('=') > 0) out.push(h);
+      }
+    } catch (e) {}
+    return out;
+  }
+  function parseLaunch() {
+    var L = { ref: '', requestKey: '', appId: '', platform: '', sign: '', userId: '', language: '', isAppUser: false, raw: {} };
+    try {
+      var qs = launchQueryStrings(), merged = {};
+      for (var i = 0; i < qs.length; i++) {
+        if (!qs[i]) continue;
+        new URLSearchParams(qs[i]).forEach(function (v, k) {
+          if (v !== null && v !== '' && merged[k] === undefined) merged[k] = v;
+        });
+      }
+      L.raw = merged;
+      L.ref = merged.vk_ref || merged.ref || '';
+      L.requestKey = merged.vk_request_key || merged.request_key || '';
+      L.appId = merged.vk_app_id || merged.app_id || '';
+      L.platform = merged.vk_platform || merged.platform || '';
+      L.sign = merged.vk_sign || merged.sign || '';
+      L.userId = merged.vk_user_id || merged.user_id || '';
+      L.language = merged.vk_language || merged.language || '';
+      L.isAppUser = String(merged.vk_is_app_user || merged.is_app_user || '') === '1';
+    } catch (e) {}
+    return L;
+  }
+  /* довнесение полей из ответа VKWebAppGetLaunchParams (ключи с vk_ и без) */
+  function mergeLaunch(d) {
+    function g(a, b) {
+      var v = d[a]; if (v === undefined || v === null || v === '') v = d[b];
+      return (v === undefined || v === null) ? '' : String(v);
+    }
+    var L = api.launch || (api.launch = {});
+    if (!L.ref) L.ref = g('vk_ref', 'ref');
+    if (!L.requestKey) L.requestKey = g('vk_request_key', 'request_key');
+    if (!L.appId) L.appId = g('vk_app_id', 'app_id');
+    if (!L.platform) L.platform = g('vk_platform', 'platform');
+    if (!L.sign) L.sign = g('vk_sign', 'sign');
+    if (!L.userId) L.userId = g('vk_user_id', 'user_id');
+    if (!L.language) L.language = g('vk_language', 'language');
+  }
 
   /* gameStart(GameReady) — строго один раз, после загрузки ассетов */
   api.gameReady = function () {
@@ -5158,29 +5218,34 @@ UI.showWin = function () {
       UI.toast('👥 ' + (LANG === 'ru' ? 'Тебя пригласили! +заряд легендарного чуда' : 'You were invited! +legendary wonder charge'), 'gold', 3000);
       save(true);
     }
-    /* v3.3 (1.2.2): внутри VK обязательна подпись параметров запуска */
-    if (VK.ready && VK.available && !VK.launch.sign) {
-      UI.showAuthStub();
-      VK.track('auth_fail', {});
-      return;
-    }
-    /* v3.3 (1.1.4): доступ только после принятия соглашения и политики */
-    if (!S.flags.consent) { UI.showConsentGate(); }
+    /* v3.3 (1.2.2): внутри VK обязательна подпись параметров запуска.
+       v3.3.1 fix: дожидаемся параметров (query/hash/мост), прежде чем блокировать. */
+    var proceed = function () {
+      if (VK.ready && VK.available && !VK.launch.sign) {
+        UI.showAuthStub();
+        VK.track('auth_fail', {});
+        return;
+      }
+      /* v3.3 (1.1.4): доступ только после принятия соглашения и политики */
+      if (!S.flags.consent) { UI.showConsentGate(); }
 
-    /* офлайн-доход */
-    E.applyOffline(function (info) {
-      if (hasSave && info && info.amount > 0) UI.showOffline(info);
-      else S.lastTs = Date.now();
-    });
+      /* офлайн-доход */
+      E.applyOffline(function (info) {
+        if (hasSave && info && info.amount > 0) UI.showOffline(info);
+        else S.lastTs = Date.now();
+      });
 
-    if (hasSave) {
-      UI.applyEra(true);
-      UI.go('menu');
-      Sound.setEraMusic(ERAS[S.era].music);
-    } else {
-      UI.applyEra(true);
-      UI.go('start');
-    }
+      if (hasSave) {
+        UI.applyEra(true);
+        UI.go('menu');
+        Sound.setEraMusic(ERAS[S.era].music);
+      } else {
+        UI.applyEra(true);
+        UI.go('start');
+      }
+    };
+    if (VK.launchReady && typeof VK.launchReady.then === 'function') VK.launchReady.then(proceed, proceed);
+    else proceed();
   }
 
   document.addEventListener('DOMContentLoaded', function () {
