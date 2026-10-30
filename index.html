@@ -1128,7 +1128,7 @@ function fmtShort(n) { return fmt(n); }
 
 
 var GAME = {
-  version: '2.0.0',
+  version: '3.6.1',
   titleRu: 'Эпохи: От Костра до Звёзд',
   titleEn: 'Ages: From Fire to Stars',
   appId: 0,                       // подставить ID приложения VK Games
@@ -1530,6 +1530,8 @@ var I18N = {
     adTimerEarly: 'Ролик закрыт на {a} с из {b} — без награды',
     adTimerNoVerify: 'Не удалось подтвердить просмотр — без награды',
     adTimerWait: 'Подтверждаем просмотр…',
+    diagTitle: 'Диагностика рекламы (последние 4)',
+    diagEmpty: 'Сессий ещё не было',
     adSimTitle: 'Реклама · тестовый режим',
     adSimSub: 'Вне VK рекламу заменяет отсчёт 30 секунд: досмотрел до конца — награда, закрыл раньше — без награды.',
     adSimClose: 'Закрыть рекламу',
@@ -1619,6 +1621,8 @@ var I18N = {
     adTimerEarly: 'Closed at {a}s of {b}s — no reward',
     adTimerNoVerify: 'Could not verify the ad watch — no reward',
     adTimerWait: 'Verifying the watch…',
+    diagTitle: 'Ad diagnostics (last 4)',
+    diagEmpty: 'No sessions yet',
     adSimTitle: 'Ad · test mode',
     adSimSub: 'Outside VK the ad is replaced by a 30-second countdown: finish it for the reward, close early for nothing.',
     adSimClose: 'Close ad',
@@ -1935,6 +1939,10 @@ var VK = (function () {
      ролики 15–20 с (кейс владельца в VK Web: просмотрел, награды не было). */
   api.reward = function (onDone) {
     var done = false;
+    /* v3.6.1: журнал рекламных сессий для диагностики по скриншоту (настройки → «Диагностика рекламы») */
+    var rec = { time: new Date().toTimeString().slice(0, 5), reason: 'pending', elapsed: 0, events: 0 };
+    (api.adLog = api.adLog || []).push(rec);
+    if (api.adLog.length > 8) api.adLog.shift();
     var clearH = function () {
       rewardEvent = null; rewardFailed = null;
       try { clearTimeout(deadline); } catch (e) {}
@@ -1943,6 +1951,8 @@ var VK = (function () {
     function finish(rewarded, simulated, reason) {
       if (done) return; done = true;
       clearH();
+      rec.reason = reason || '?';
+      rec.elapsed = shownAt ? Math.round((Date.now() - shownAt) / 1000) : 0;
       log('reward finish: rewarded=' + !!rewarded + ' reason=' + reason);
       /* v3.4.2: уведомляем UI о завершении сессии (для счётчика до награды) */
       try { if (typeof api.onAdFinish === 'function') api.onAdFinish(reason || '', shownAt ? Math.round((Date.now() - shownAt) / 1000) : 0); } catch (e) { /* hook */ }
@@ -1972,6 +1982,7 @@ var VK = (function () {
     try { document.addEventListener('visibilitychange', onVis); } catch (e) {}
     rewardEvent = function (d) {
       if (done) return;
+      rec.events++;
       var now = Date.now();
       if (d && d.request_id !== undefined && (now - reqAt) < 3000) { log('reward: open envelope ignored'); openEv = true; if (!shownAt) shownAt = now; return; }
       openEv = true;
@@ -5073,6 +5084,15 @@ UI.renderSettings = function () {
     });
   });
   r8.appendChild(b8);
+  /* v3.6.1: диагностика рекламных сессий (видно по скриншоту настроек, какую ветку выбрал гейт) */
+  var rAd = row('<b>' + T('diagTitle') + '</b>');
+  var adl = document.createElement('div');
+  adl.style.fontSize = '11px'; adl.style.opacity = '.85'; adl.style.textAlign = 'right'; adl.style.lineHeight = '1.5';
+  var adLog = (VK.adLog || []).slice(-4);
+  adl.innerHTML = adLog.length ? adLog.map(function (e) {
+    return e.time + ' · ' + e.reason + ' · ' + e.elapsed + 's · ev:' + e.events;
+  }).join('<br>') : T('diagEmpty');
+  rAd.appendChild(adl);
   /* версия */
   var r9 = row('<b style="font-size:11px;opacity:.7">v' + GAME.version + ' · ' + GAME.titleRu + ' / ' + GAME.titleEn + '</b>');
 };
