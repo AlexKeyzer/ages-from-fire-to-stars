@@ -657,23 +657,15 @@ body.lowfx .intro-slide { filter: none; }
 
 /* ============================== v3.3 COMPLIANCE ========================== */
 #authStub { position: absolute; inset: 0; z-index: 96; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(6,4,14,.72); }
-/* v3.4.2: счётчик секунд до награды во время rewarded-сессии */
-#adTimer { position: fixed; left: 50%; top: calc(10px + env(safe-area-inset-top, 0px)); transform: translateX(-50%); z-index: 98; display: none; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; background: rgba(10,8,24,.86); border: 1px solid rgba(255,255,255,.28); backdrop-filter: blur(6px); font-weight: 800; font-size: 14px; color: #fff; box-shadow: 0 6px 18px rgba(0,0,0,.35); pointer-events: none; }
-#adTimer.show { display: flex; }
-#adTimer .at-ic { width: 18px; height: 18px; flex: 0 0 auto; }
-#adTimer .at-txt { white-space: nowrap; font-variant-numeric: tabular-nums; }
-#adTimer .at-bar { width: 64px; height: 6px; border-radius: 4px; background: rgba(255,255,255,.18); overflow: hidden; }
-#adTimer .at-bar i { display: block; height: 100%; width: 100%; background: #ffd166; border-radius: 4px; transition: width .25s linear; }
-#adTimer.bad { border-color: #ff8095; color: #ffd7dd; }
-#adTimer.bad .at-bar i { background: #ff8095; }
-#adTimer.ok { border-color: #8dffa8; color: #d9ffe6; }
-#adTimer.ok .at-bar i { background: #8dffa8; }
-/* v3.5: стена-заглушка тестовой рекламы вне VK */
 #adSimWall { position: fixed; inset: 0; z-index: 97; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 14px; padding: 24px; background: radial-gradient(120% 90% at 50% 10%, rgba(38,26,74,.96), rgba(6,4,14,.97)); text-align: center; }
 #adSimWall.show { display: flex; }
 #adSimWall .sw-ic { width: 64px; height: 64px; }
 #adSimWall h3 { margin: 0; font-size: 18px; color: #fff; }
 #adSimWall .sw-sub { max-width: 330px; font-size: 13px; line-height: 1.45; color: rgba(255,255,255,.72); }
+/* v3.7: отсчёт живёт ВНУТРИ стены-заглушки (это и есть «ролик» тест-режима), поверх игры ничего не рисуется */
+#adSimWall .sw-count { font-size: 22px; font-weight: 800; color: #ffd166; font-variant-numeric: tabular-nums; }
+#adSimWall .sw-bar { width: min(320px, 70vw); height: 8px; border-radius: 6px; background: rgba(255,255,255,.16); overflow: hidden; }
+#adSimWall .sw-bar i { display: block; height: 100%; width: 100%; background: #ffd166; border-radius: 6px; transition: width .25s linear; }
 #adSimWall .sw-close { margin-top: 12px; }
 
 </style>
@@ -1128,7 +1120,7 @@ function fmtShort(n) { return fmt(n); }
 
 
 var GAME = {
-  version: '3.6.1',
+  version: '3.7.0',
   titleRu: 'Эпохи: От Костра до Звёзд',
   titleEn: 'Ages: From Fire to Stars',
   appId: 0,                       // подставить ID приложения VK Games
@@ -1526,10 +1518,9 @@ var I18N = {
     adNotWatched: 'Награда начисляется за полный просмотр рекламы (~30 сек)',
     adNotInVk: 'Реклама доступна в клиенте VK — награда начисляется только за просмотр',
     adTimerLeft: 'Награда через: {n} с',
-    adTimerGot: 'Награда получена!',
-    adTimerEarly: 'Ролик закрыт на {a} с из {b} — без награды',
+    adRewardGot: 'Награда получена',
+    adEarlyClose: 'Реклама не просмотрена, награда не получена',
     adTimerNoVerify: 'Не удалось подтвердить просмотр — без награды',
-    adTimerWait: 'Подтверждаем просмотр…',
     diagTitle: 'Диагностика рекламы (последние 4)',
     diagEmpty: 'Сессий ещё не было',
     adSimTitle: 'Реклама · тестовый режим',
@@ -1617,10 +1608,9 @@ var I18N = {
     adNotWatched: 'The reward is granted after watching the ad in full (~30 sec)',
     adNotInVk: 'Ads are available in the VK client app — the reward is granted for watching only',
     adTimerLeft: 'Reward in {n} s',
-    adTimerGot: 'Reward received!',
-    adTimerEarly: 'Closed at {a}s of {b}s — no reward',
+    adRewardGot: 'Reward received',
+    adEarlyClose: 'Ad not watched — reward not received',
     adTimerNoVerify: 'Could not verify the ad watch — no reward',
-    adTimerWait: 'Verifying the watch…',
     diagTitle: 'Ad diagnostics (last 4)',
     diagEmpty: 'No sessions yet',
     adSimTitle: 'Ad · test mode',
@@ -3961,87 +3951,38 @@ UI.help = function (title, rows) {
 /* =============================================== REWARDED: 6 ТОЧЕК */
 /* v3.4.1: единая точка отказа награды — причина от VK.reward → честный тост, попытка не списана */
 UI.adDenyToast = function (reason) {
-  var k = reason === 'early' ? 'adNotWatched' : reason === 'notvk' ? 'adNotInVk' : reason === 'noverify' ? 'adTimerNoVerify' : 'adNoFill';
-  UI.toast(T(k), reason === 'early' || reason === 'noverify' ? 'bad' : '', 2600);
+  /* v3.7: early закрывает центральное уведомление «Реклама не просмотрена…» — дубль не нужен */
+  if (reason === 'early') return;
+  var k = reason === 'notvk' ? 'adNotInVk' : reason === 'noverify' ? 'adTimerNoVerify' : 'adNoFill';
+  UI.toast(T(k), reason === 'noverify' ? 'bad' : '', 2600);
 };
-/* v3.4.2: счётчик секунд до награды — пилюля поверх интерфейса.
-   Стартует по хуку VK.onAdShown (ролик открыт), тикает 250 мс,
-   по VK.onAdFinish показывает исход: watched/early/noverify/nofill/error.
-   notvk — сессии нет, виджет не показывается (достаточно тоста). */
-UI.adTimer = {
-  el: null, iv: 0, t0: 0, minSec: 30, hideT: 0,
-  mount: function () {
-    if (this.el && this.el.parentNode) return this.el;
-    var el = document.createElement('div');
-    el.id = 'adTimer';
-    el.innerHTML = iconImg('ad', 'at-ic') + '<span class="at-txt"></span><span class="at-bar"><i></i></span>';
-    (document.getElementById('app') || document.body).appendChild(el);
-    this.el = el;
-    return el;
-  },
+/* v3.7 (спека владельца): таймера поверх игры НЕТ. Исход рекламы — уведомление:
+   watched → «Награда получена», early → «Реклама не просмотрена, награда не получена».
+   Отсчёт существует только ВНУТРИ стены-заглушки тест-режима (вне VK). */
+UI.adResultNotify = function (reason, elapsedSec) {
+  UI.adSimWall.hide();
+  if (reason === 'watched') UI.toast(T('adRewardGot'), 'good', 2600);
+  else if (reason === 'early') UI.toast(T('adEarlyClose'), 'bad', 3000);
+};
+VK.onAdFinish = function (reason, elapsedSec) { UI.adResultNotify(reason, elapsedSec); };
+/* v3.5: тестовая реклама вне VK — стена-заглушка с кнопкой раннего закрытия и своим отсчётом */
+UI.adSimWall = {
+  el: null, sim: null, iv: 0, t0: 0, minSec: 30,
   render: function () {
-    var self = UI.adTimer;
+    var self = UI.adSimWall;
     if (!self.el || !self.el.parentNode) return;
     var left = Math.max(0, self.minSec - Math.floor((Date.now() - self.t0) / 1000));
-    var txt = self.el.querySelector('.at-txt');
-    /* v3.5.1: отсчёт дошёл до 0 раньше итогового события (платформа подтверждает с задержкой) */
-    if (txt) txt.textContent = left > 0 ? T('adTimerLeft', { n: left }) : T('adTimerWait');
-    var bar = self.el.querySelector('.at-bar i');
-    if (bar) bar.style.width = (left > 0 ? Math.max(0, Math.min(100, (left / self.minSec) * 100)) : 0) + '%';
+    var c = self.el.querySelector('.sw-count');
+    if (c) c.textContent = T('adTimerLeft', { n: left });
+    var bar = self.el.querySelector('.sw-bar i');
+    if (bar) bar.style.width = Math.max(0, Math.min(100, (left / self.minSec) * 100)) + '%';
   },
-  start: function (minMs) {
-    var self = UI.adTimer;
-    clearTimeout(self.hideT);
-    self.minSec = Math.max(1, Math.round((minMs || 30000) / 1000));
-    self.t0 = Date.now();
-    var el = self.mount();
-    el.className = 'show';
-    self.render();
-    clearInterval(self.iv);
-    self.iv = setInterval(self.render, 250);
-  },
-  finish: function (reason, elapsedSec) {
-    var self = UI.adTimer;
-    clearInterval(self.iv); self.iv = 0;
-    clearTimeout(self.hideT);
-    UI.adSimWall.hide();   /* v3.5: любой исход сессии убирает стену-заглушку */
-    if (!self.el || !self.el.parentNode) return;
-    var txt = self.el.querySelector('.at-txt'), bar = self.el.querySelector('.at-bar i'), hideMs = 2600;
-    if (reason === 'watched') {
-      self.el.className = 'show ok';
-      if (txt) txt.textContent = T('adTimerGot');
-      if (bar) bar.style.width = '100%';
-      hideMs = 1800;
-    } else if (reason === 'early') {
-      self.el.className = 'show bad';
-      if (txt) txt.textContent = T('adTimerEarly', { a: Math.max(0, Math.min(elapsedSec || 0, self.minSec)), b: self.minSec });
-      hideMs = 3000;
-    } else if (reason === 'noverify') {
-      self.el.className = 'show bad';
-      if (txt) txt.textContent = T('adTimerNoVerify');
-      hideMs = 3000;
-    } else if (reason === 'nofill' || reason === 'error') {
-      self.el.className = 'show bad';
-      if (txt) txt.textContent = T('adNoFill');
-      hideMs = 2200;
-    } else {
-      self.el.className = '';
-      return;
-    }
-    self.hideT = setTimeout(function () { if (UI.adTimer.el) UI.adTimer.el.className = ''; }, hideMs);
-  }
-};
-VK.onAdShown = function (minMs) { UI.adTimer.start(minMs); };
-VK.onAdFinish = function (reason, elapsedSec) { UI.adTimer.finish(reason, elapsedSec); };
-/* v3.5: тестовая реклама вне VK — стена-заглушка с кнопкой раннего закрытия */
-UI.adSimWall = {
-  el: null, sim: null,
-  show: function (sim) {
+  show: function (sim, minMs) {
     var self = UI.adSimWall;
     if (!self.el || !self.el.parentNode) {
       var el = document.createElement('div');
       el.id = 'adSimWall';
-      el.innerHTML = iconImg('ad', 'sw-ic') + '<h3></h3><div class="sw-sub"></div><button class="pill sw-close"><span></span></button>';
+      el.innerHTML = iconImg('ad', 'sw-ic') + '<h3></h3><div class="sw-sub"></div><div class="sw-count"></div><div class="sw-bar"><i></i></div><button class="pill sw-close"><span></span></button>';
       (document.getElementById('app') || document.body).appendChild(el);
       el.querySelector('.sw-close').addEventListener('click', function () {
         Sound.sfx('ui');
@@ -4050,18 +3991,24 @@ UI.adSimWall = {
       self.el = el;
     }
     self.sim = sim || null;
+    self.minSec = Math.max(1, Math.round((minMs || 30000) / 1000));
+    self.t0 = Date.now();
     self.el.querySelector('h3').textContent = T('adSimTitle');
     self.el.querySelector('.sw-sub').textContent = T('adSimSub');
     self.el.querySelector('.sw-close span').textContent = T('adSimClose');
     self.el.classList.add('show');
+    self.render();
+    clearInterval(self.iv);
+    self.iv = setInterval(self.render, 250);
   },
   hide: function () {
     var self = UI.adSimWall;
     self.sim = null;
+    clearInterval(self.iv); self.iv = 0;
     if (self.el && self.el.parentNode) self.el.classList.remove('show');
   }
 };
-VK.onAdSim = function (minMs, sim) { UI.adSimWall.show(sim); };
+VK.onAdSim = function (minMs, sim) { UI.adSimWall.show(sim, minMs); };
 UI.adGate = function (cb) {
   Sound.ensure();
   UI.modal({
